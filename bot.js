@@ -5,21 +5,11 @@ const client = new Client({ token: 'gapi_p250JWJU+F/HVxIeYU6y50vi42LdreYxMf3e6wr
 const attendanceChannelId = '2a41589e-d9a7-4c51-9ddb-a2351a2fbe7e';
 const calendarChannelId = '98fb5e68-bebd-44ad-8c65-ade71f56df14';
 
-
 let isCounting = false;
 let lastCommand = null;
 let lastProcessedDate = null;
 const subjects = ['math', 'phy', 'c', 'mech', 'plab', 'clab', 'kan', 'sub1'];
 
-// attendanceData structure:
-// attendanceData[userId] = {
-//   [subject]: {
-//     attended: number,
-//     total: number,
-//     absentToday: boolean,
-//     absentDates: [{ date: string, fullAbsence: boolean }]
-//   }
-// }
 let attendanceData;
 try {
     attendanceData = JSON.parse(fs.readFileSync('attendance.json', 'utf8'));
@@ -34,13 +24,13 @@ try {
     }
 }
 
-// Helper function to initialize subject data with the correct structure
 function initializeSubjectData() {
     return {
         attended: 0,
         total: 0,
         absentToday: false,
-        absentDates: []
+        absentDates: [],
+        processedClasses: []
     };
 }
 
@@ -104,10 +94,69 @@ async function sendInstructions(channelId) {
     await client.rest.post(`/channels/${channelId}/messages`, { content: instructions });
 }
 
+async function checkAndMarkAttendance() {
+    if (!isCounting) return;
+
+    const today = new Date();
+    const todayStr = today.toLocaleDateString('en-GB');
+    const now = today.getTime();
+
+    const events = await getCalendarEvents(today);
+    const isHoliday = events.calendarEvents.some(e => e.name.toLowerCase().includes('holiday') || e.name.toLowerCase().includes('festival'));
+    if (isHoliday) return;
+
+    for (const userId in attendanceData) {
+        if (!attendanceData[userId]) continue;
+
+        for (const event of events.calendarEvents) {
+            const startTime = new Date(event.startsAt).getTime();
+            const subject = event.name.toLowerCase().replace(' class', '').trim();
+            if (!subjects.includes(subject)) continue;
+
+            if (!attendanceData[userId][subject]) {
+                attendanceData[userId][subject] = initializeSubjectData();
+            }
+
+            const eventId = event.id;
+            const hasProcessed = attendanceData[userId][subject].processedClasses.some(
+                entry => entry.eventId === eventId && entry.date === todayStr
+            );
+
+            if (hasProcessed || startTime > now) continue;
+
+            const isAbsentToday = attendanceData[userId][subject].absentToday;
+            const hasFullAbsence = attendanceData[userId][subject].absentDates.some(
+                entry => entry.date === todayStr && entry.fullAbsence
+            );
+            const hasSubjectAbsence = attendanceData[userId][subject].absentDates.some(
+                entry => entry.date === todayStr && !entry.fullAbsence
+            );
+
+            if (!isAbsentToday && !hasFullAbsence && !hasSubjectAbsence) {
+                attendanceData[userId][subject].attended += 1;
+                attendanceData[userId][subject].total += 1;
+                console.log(`Marked ${userId} as present for ${subject} on ${todayStr} at ${event.startsAt}`);
+            } else if (hasSubjectAbsence && !hasFullAbsence) {
+                attendanceData[userId][subject].total += 1;
+                console.log(`Marked ${userId} as absent for ${subject} on ${todayStr} at ${event.startsAt} (subject-specific absence)`);
+            } else if (hasFullAbsence) {
+                attendanceData[userId][subject].total += 1;
+                console.log(`Marked ${userId} as absent for ${subject} on ${todayStr} at ${event.startsAt} (full absence)`);
+            }
+
+            attendanceData[userId][subject].processedClasses.push({ eventId, date: todayStr });
+        }
+    }
+
+    fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
+}
+
 client.on('ready', async () => {
     console.log('Bot is ready!');
     await clearMessages(attendanceChannelId);
     await sendInstructions(attendanceChannelId);
+
+    setInterval(checkAndMarkAttendance, 60 * 1000);
 });
 
 client.on('messageCreated', async (message) => {
@@ -125,7 +174,6 @@ client.on('messageCreated', async (message) => {
     const today = new Date();
     const todayStr = today.toLocaleDateString('en-GB');
 
-    // Reset absentToday if the day has changed
     if (lastProcessedDate !== todayStr) {
         for (const userId in attendanceData) {
             for (const subject in attendanceData[userId]) {
@@ -138,18 +186,17 @@ client.on('messageCreated', async (message) => {
 
     if (!attendanceData[targetId]) attendanceData[targetId] = {};
 
-    // Check for !abbDDMMYYYY command
     const retroactiveAbsenceMatch = command.match(/^!abb(\d{8})$/);
     let events;
     let targetDate = today;
     let targetDateStr = todayStr;
 
     if (retroactiveAbsenceMatch) {
-        const dateStr = retroactiveAbsenceMatch[1]; // e.g., "25032025"
-        const day = dateStr.slice(0, 2); // "25"
-        const month = dateStr.slice(2, 4); // "03"
-        const year = dateStr.slice(4, 8); // "2025"
-        const parsedDateStr = `${day}/${month}/${year}`; // "25/03/2025"
+        const dateStr = retroactiveAbsenceMatch[1];
+        const day = dateStr.slice(0, 2);
+        const month = dateStr.slice(2, 4);
+        const year = dateStr.slice(4, 8);
+        const parsedDateStr = `${day}/${month}/${year}`;
         const parsedDate = new Date(`${year}-${month}-${day}`);
 
         if (isNaN(parsedDate.getTime())) {
@@ -171,25 +218,21 @@ client.on('messageCreated', async (message) => {
         return;
     }
 
-    // Start/Stop counting
     if (command === '!startcount') {
         isCounting = true;
         await client.rest.post(`/channels/${channelId}/messages`, { content: 'Attendance tracking started!' });
     } else if (command === '!stopcount') {
         isCounting = false;
-        // Clear all attendance data for a fresh start
         attendanceData = {};
         fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
         await client.rest.post(`/channels/${channelId}/messages`, { content: 'Attendance tracking paused! All data has been reset.' });
-        return; // Exit early to avoid further processing
+        return;
     }
 
-    // Test command
     if (command === '!test') {
         await client.rest.post(`/channels/${channelId}/messages`, { content: 'Bot is working!' });
     }
 
-    // Help command
     if (command === '!help') {
         const helpMessage = `
 **Attendance Bot Commands:**
@@ -211,7 +254,6 @@ client.on('messageCreated', async (message) => {
         await client.rest.post(`/channels/${channelId}/messages`, { content: helpMessage });
     }
 
-    // When command
     if (command === '!when') {
         if (!attendanceData[targetId] || Object.keys(attendanceData[targetId]).length === 0) {
             await client.rest.post(`/channels/${channelId}/messages`, { content: `${targetId === senderId ? 'You have' : `<@${targetId}> has`} no absence records yet!` });
@@ -241,11 +283,9 @@ client.on('messageCreated', async (message) => {
         await client.rest.post(`/channels/${channelId}/messages`, { content: absenceList });
     }
 
-    // Allow !att, !att<subject>, !test, !help, and !when to run even if isCounting is false
     if (!isCounting && !['!startcount', '!stopcount', '!att', '!test', '!help', '!when'].includes(command) && !command.startsWith('!att')) return;
 
-    // Attendance commands
-    if (command === '!abb' || retroactiveAbsenceMatch) { // Absent for all classes (today or specific date)
+    if (command === '!abb' || retroactiveAbsenceMatch) {
         const subjectCounts = {};
         for (const event of events.calendarEvents) {
             const subject = event.name.toLowerCase().replace(' class', '').trim();
@@ -255,16 +295,16 @@ client.on('messageCreated', async (message) => {
             subjectCounts[subject] += 1;
         }
 
-        // If the date has already been marked, remove the previous entry to avoid double-counting
         for (const subject in subjectCounts) {
             if (!attendanceData[targetId][subject]) {
                 attendanceData[targetId][subject] = initializeSubjectData();
             }
-            // Remove any existing absence record for this date to avoid duplicates
             attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
                 entry => entry.date !== targetDateStr
             );
-            // If this date was previously counted, adjust total
+            attendanceData[targetId][subject].processedClasses = attendanceData[targetId][subject].processedClasses.filter(
+                entry => entry.date !== targetDateStr
+            );
             const wasPreviouslyCounted = attendanceData[targetId][subject].absentDates.some(
                 entry => entry.date === targetDateStr
             );
@@ -289,7 +329,7 @@ client.on('messageCreated', async (message) => {
         }
         lastCommand = { type: 'abb', targetId, events, date: targetDateStr };
         await client.rest.post(`/channels/${channelId}/messages`, { content: `Noted! ${targetId === senderId ? 'Your' : `<@${targetId}>’s`} status for ${targetDateStr}:\n${getStatus(targetId)}` });
-    } else if (command.startsWith('!abb') && subjects.includes(command.slice(4))) { // Absent for specific subject
+    } else if (command.startsWith('!abb') && subjects.includes(command.slice(4))) {
         const subject = command.slice(4);
         const subjectEvents = events.calendarEvents.filter(event => event.name.toLowerCase().replace(' class', '').trim() === subject);
         const numClasses = subjectEvents.length;
@@ -304,13 +344,12 @@ client.on('messageCreated', async (message) => {
         }
         lastCommand = { type: 'abbSubject', targetId, subject, events };
         await client.rest.post(`/channels/${channelId}/messages`, { content: `Noted! ${targetId === senderId ? 'Your' : `<@${targetId}>’s`} status:\n${getStatus(targetId)}` });
-    } else if (command === '!abbrest') { // Absent for remaining classes
+    } else if (command === '!abbrest') {
         const now = today.getTime();
         const todayStr = today.toLocaleDateString('en-GB');
         const subjectCounts = {};
         const futureSubjectCounts = {};
 
-        // Count all classes for the day
         for (const event of events.calendarEvents) {
             const subject = event.name.toLowerCase().replace(' class', '').trim();
             if (!subjectCounts[subject]) {
@@ -318,7 +357,6 @@ client.on('messageCreated', async (message) => {
             }
             subjectCounts[subject] += 1;
 
-            // Separately count future classes
             const startTime = new Date(event.startsAt).getTime();
             if (startTime > now) {
                 if (!futureSubjectCounts[subject]) {
@@ -328,22 +366,21 @@ client.on('messageCreated', async (message) => {
             }
         }
 
-        // Process all subjects that have classes today
         for (const subject in subjectCounts) {
             if (!attendanceData[targetId][subject]) {
                 attendanceData[targetId][subject] = initializeSubjectData();
             }
 
-            // Remove any existing absence record for this date to avoid duplicates
             attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
                 entry => entry.date !== todayStr
             );
+            attendanceData[targetId][subject].processedClasses = attendanceData[targetId][subject].processedClasses.filter(
+                entry => entry.date !== todayStr
+            );
 
-            // Calculate past/ongoing classes (total - future)
             const pastClasses = subjectCounts[subject] - (futureSubjectCounts[subject] || 0);
             const futureClasses = futureSubjectCounts[subject] || 0;
 
-            // If this subject was already processed today, adjust totals
             const wasPreviouslyCounted = attendanceData[targetId][subject].absentDates.some(
                 entry => entry.date === todayStr
             );
@@ -351,12 +388,9 @@ client.on('messageCreated', async (message) => {
                 attendanceData[targetId][subject].total -= subjectCounts[subject];
             }
 
-            // Update totals and attendance
             attendanceData[targetId][subject].total += subjectCounts[subject];
             if (!attendanceData[targetId][subject].absentToday) {
-                // Mark past/ongoing classes as present
                 attendanceData[targetId][subject].attended += pastClasses;
-                // Mark future classes as absent (attended remains 0 for those)
                 if (futureClasses > 0) {
                     attendanceData[targetId][subject].absentToday = true;
                     attendanceData[targetId][subject].absentDates.push({ date: todayStr, fullAbsence: true });
@@ -366,7 +400,7 @@ client.on('messageCreated', async (message) => {
 
         lastCommand = { type: 'abbrest', targetId, events, date: todayStr };
         await client.rest.post(`/channels/${channelId}/messages`, { content: `Noted! ${targetId === senderId ? 'Your' : `<@${targetId}>’s`} status:\n${getStatus(targetId)}` });
-    } else if (command === '!extra') { // Extra class
+    } else if (command === '!extra') {
         const subject = args[2]?.toLowerCase() || args[1]?.toLowerCase();
         if (!subjects.includes(subject)) {
             await client.rest.post(`/channels/${channelId}/messages`, { content: 'Invalid subject!' });
@@ -379,7 +413,7 @@ client.on('messageCreated', async (message) => {
         attendanceData[targetId][subject].attended += 1;
         lastCommand = { type: 'extra', targetId, subject };
         await client.rest.post(`/channels/${channelId}/messages`, { content: `Extra ${subject} class recorded for ${targetId === senderId ? 'you' : `<@${targetId}>`}.` });
-    } else if (command.startsWith('!att') && subjects.includes(command.slice(4))) { // Subject-specific attendance
+    } else if (command.startsWith('!att') && subjects.includes(command.slice(4))) {
         const subject = command.slice(4);
         if (!attendanceData[targetId][subject]) {
             attendanceData[targetId][subject] = initializeSubjectData();
@@ -390,7 +424,7 @@ client.on('messageCreated', async (message) => {
         const apiResponse = await client.rest.post(`/channels/${channelId}/messages`, { content: response });
         console.log('Sent message:', response);
         console.log('API response:', apiResponse);
-    } else if (command === '!att') { // All subjects in a box
+    } else if (command === '!att') {
         console.log('Target ID:', targetId);
         console.log('Attendance data for target:', attendanceData[targetId]);
         if (Object.keys(attendanceData[targetId]).length === 0) {
@@ -410,7 +444,7 @@ client.on('messageCreated', async (message) => {
         const apiResponse = await client.rest.post(`/channels/${channelId}/messages`, { content: response });
         console.log('Sent message:', response);
         console.log('API response:', apiResponse);
-    } else if (command === '!undo' && lastCommand && lastCommand.targetId === targetId) { // Undo last command
+    } else if (command === '!undo' && lastCommand && lastCommand.targetId === targetId) {
         const undoDateStr = lastCommand.date || todayStr;
         if (lastCommand.type === 'abb') {
             const subjectCounts = {};
@@ -423,11 +457,14 @@ client.on('messageCreated', async (message) => {
             }
             for (const subject in subjectCounts) {
                 attendanceData[targetId][subject].total -= subjectCounts[subject];
-                attendanceData[targetId][subject].attended = 0; // Reset to 0 since it was set to 0
+                attendanceData[targetId][subject].attended = 0;
                 if (undoDateStr === todayStr) {
                     delete attendanceData[targetId][subject].absentToday;
                 }
                 attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
+                    entry => entry.date !== undoDateStr
+                );
+                attendanceData[targetId][subject].processedClasses = attendanceData[targetId][subject].processedClasses.filter(
                     entry => entry.date !== undoDateStr
                 );
             }
@@ -438,6 +475,9 @@ client.on('messageCreated', async (message) => {
                     attendanceData[targetId][evtSubject].attended += 1;
                     attendanceData[targetId][evtSubject].total -= 1;
                     attendanceData[targetId][evtSubject].absentDates = attendanceData[targetId][evtSubject].absentDates.filter(
+                        entry => entry.date !== todayStr
+                    );
+                    attendanceData[targetId][evtSubject].processedClasses = attendanceData[targetId][evtSubject].processedClasses.filter(
                         entry => entry.date !== todayStr
                     );
                 } else {
@@ -467,15 +507,18 @@ client.on('messageCreated', async (message) => {
             for (const subject in subjectCounts) {
                 const pastClasses = subjectCounts[subject] - (futureSubjectCounts[subject] || 0);
                 attendanceData[targetId][subject].total -= subjectCounts[subject];
-                attendanceData[targetId][subject].attended -= pastClasses; // Remove the past classes marked as present
+                attendanceData[targetId][subject].attended -= pastClasses;
                 delete attendanceData[targetId][subject].absentToday;
                 attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
+                    entry => entry.date !== undoDateStr
+                );
+                attendanceData[targetId][subject].processedClasses = attendanceData[targetId][subject].processedClasses.filter(
                     entry => entry.date !== undoDateStr
                 );
             }
         } else if (lastCommand.type === 'extra') {
             attendanceData[targetId][lastCommand.subject].total -= 1;
-            attendanceData[targetId][lastCommand.subject].attended -= 1;
+            attendanceData[targetId][subject].attended -= 1;
         }
         lastCommand = null;
         await client.rest.post(`/channels/${channelId}/messages`, { content: 'Last command undone!' });
