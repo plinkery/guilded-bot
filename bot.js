@@ -44,7 +44,7 @@ async function getCalendarEvents(date) {
     start.setHours(0, 0, 0, 0);
     const end = new Date(date);
     end.setHours(23, 59, 59, 999);
-    const events = await client.rest.get(`/channels/${calendarChannelId}/events?startDate=${start.toISOString()}&endDate=${end.toISOString()}`);
+    const events = await client.rest.get(`/channels/${calendarChannelId}/events?start_date=${start.toISOString()}&end_date=${end.toISOString()}`);
     console.log('Fetched events for date', date.toLocaleDateString('en-GB'), ':', JSON.stringify(events, null, 2));
     return events;
 }
@@ -153,6 +153,20 @@ async function checkAndMarkAttendance() {
 
 client.on('ready', async () => {
     console.log('Bot is ready!');
+    // Fetch all guild members and initialize their attendance data
+    const guilds = await client.guilds.fetchAll();
+    const guild = guilds.first(); // Assuming the bot is in one guild
+    const members = await guild.members.fetchAll();
+    for (const member of members) {
+        const userId = member.id;
+        if (!attendanceData[userId]) {
+            attendanceData[userId] = {};
+            for (const subject of subjects) {
+                attendanceData[userId][subject] = initializeSubjectData();
+            }
+        }
+    }
+    fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
     await clearMessages(attendanceChannelId);
     await sendInstructions(attendanceChannelId);
 
@@ -184,7 +198,12 @@ client.on('messageCreated', async (message) => {
         fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
     }
 
-    if (!attendanceData[targetId]) attendanceData[targetId] = {};
+    if (!attendanceData[targetId]) {
+        attendanceData[targetId] = {};
+        for (const subject of subjects) {
+            attendanceData[targetId][subject] = initializeSubjectData();
+        }
+    }
 
     const retroactiveAbsenceMatch = command.match(/^!abb(\d{8})$/);
     let events;
@@ -348,20 +367,28 @@ client.on('messageCreated', async (message) => {
         const now = today.getTime();
         const todayStr = today.toLocaleDateString('en-GB');
         const subjectCounts = {};
+        const pastSubjectCounts = {};
         const futureSubjectCounts = {};
 
+        // Count all classes, past classes, and future classes for today
         for (const event of events.calendarEvents) {
+            const eventDateStr = new Date(event.startsAt).toLocaleDateString('en-GB');
+            if (eventDateStr !== todayStr) continue; // Skip events not on today
+
             const subject = event.name.toLowerCase().replace(' class', '').trim();
+            if (!subjects.includes(subject)) continue;
+
             if (!subjectCounts[subject]) {
                 subjectCounts[subject] = 0;
+                pastSubjectCounts[subject] = 0;
+                futureSubjectCounts[subject] = 0;
             }
             subjectCounts[subject] += 1;
 
             const startTime = new Date(event.startsAt).getTime();
-            if (startTime > now) {
-                if (!futureSubjectCounts[subject]) {
-                    futureSubjectCounts[subject] = 0;
-                }
+            if (startTime <= now) {
+                pastSubjectCounts[subject] += 1;
+            } else {
                 futureSubjectCounts[subject] += 1;
             }
         }
@@ -371,6 +398,7 @@ client.on('messageCreated', async (message) => {
                 attendanceData[targetId][subject] = initializeSubjectData();
             }
 
+            // Clear today's processed classes and absences
             attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
                 entry => entry.date !== todayStr
             );
@@ -378,23 +406,25 @@ client.on('messageCreated', async (message) => {
                 entry => entry.date !== todayStr
             );
 
-            const pastClasses = subjectCounts[subject] - (futureSubjectCounts[subject] || 0);
+            const pastClasses = pastSubjectCounts[subject] || 0;
             const futureClasses = futureSubjectCounts[subject] || 0;
+            const totalClasses = subjectCounts[subject];
 
-            const wasPreviouslyCounted = attendanceData[targetId][subject].absentDates.some(
+            // Reset total and attended for today
+            const wasPreviouslyCounted = attendanceData[targetId][subject].processedClasses.some(
                 entry => entry.date === todayStr
             );
             if (wasPreviouslyCounted) {
-                attendanceData[targetId][subject].total -= subjectCounts[subject];
+                attendanceData[targetId][subject].total -= totalClasses;
+                attendanceData[targetId][subject].attended = 0;
             }
 
-            attendanceData[targetId][subject].total += subjectCounts[subject];
-            if (!attendanceData[targetId][subject].absentToday) {
-                attendanceData[targetId][subject].attended += pastClasses;
-                if (futureClasses > 0) {
-                    attendanceData[targetId][subject].absentToday = true;
-                    attendanceData[targetId][subject].absentDates.push({ date: todayStr, fullAbsence: true });
-                }
+            // Mark past classes as attended, future classes as absent
+            attendanceData[targetId][subject].total += totalClasses;
+            attendanceData[targetId][subject].attended += pastClasses;
+            if (futureClasses > 0) {
+                attendanceData[targetId][subject].absentToday = true;
+                attendanceData[targetId][subject].absentDates.push({ date: todayStr, fullAbsence: false });
             }
         }
 
@@ -421,14 +451,11 @@ client.on('messageCreated', async (message) => {
         const { attended, total } = attendanceData[targetId][subject];
         const percentage = total > 0 ? Math.max(0, (attended / total) * 100) : 0;
         const response = `${targetId === senderId ? 'Your' : `<@${targetId}>’s`} **${subject}**: ${percentage.toFixed(2)}% (${attended}/${total})`;
-        const apiResponse = await client.rest.post(`/channels/${channelId}/messages`, { content: response });
-        console.log('Sent message:', response);
-        console.log('API response:', apiResponse);
+        await client.rest.post(`/channels/${channelId}/messages`, { content: response });
     } else if (command === '!att') {
         console.log('Target ID:', targetId);
         console.log('Attendance data for target:', attendanceData[targetId]);
         if (Object.keys(attendanceData[targetId]).length === 0) {
-            console.log('No attendance data - sending message');
             await client.rest.post(`/channels/${channelId}/messages`, { content: `${targetId === senderId ? 'You have' : `<@${targetId}> has`} no attendance data yet!` });
             return;
         }
@@ -441,9 +468,7 @@ client.on('messageCreated', async (message) => {
                 response += `**${subject}**: ${percentage.toFixed(2)}% (${attended}/${total}) ${status}\n`;
             }
         }
-        const apiResponse = await client.rest.post(`/channels/${channelId}/messages`, { content: response });
-        console.log('Sent message:', response);
-        console.log('API response:', apiResponse);
+        await client.rest.post(`/channels/${channelId}/messages`, { content: response });
     } else if (command === '!undo' && lastCommand && lastCommand.targetId === targetId) {
         const undoDateStr = lastCommand.date || todayStr;
         if (lastCommand.type === 'abb') {
@@ -490,6 +515,9 @@ client.on('messageCreated', async (message) => {
             const futureSubjectCounts = {};
             const now = today.getTime();
             for (const event of lastCommand.events.calendarEvents) {
+                const eventDateStr = new Date(event.startsAt).toLocaleDateString('en-GB');
+                if (eventDateStr !== todayStr) continue;
+
                 const subject = event.name.toLowerCase().replace(' class', '').trim();
                 if (!subjectCounts[subject]) {
                     subjectCounts[subject] = 0;
@@ -518,7 +546,7 @@ client.on('messageCreated', async (message) => {
             }
         } else if (lastCommand.type === 'extra') {
             attendanceData[targetId][lastCommand.subject].total -= 1;
-            attendanceData[targetId][subject].attended -= 1;
+            attendanceData[targetId][lastCommand.subject].attended -= 1;
         }
         lastCommand = null;
         await client.rest.post(`/channels/${channelId}/messages`, { content: 'Last command undone!' });
