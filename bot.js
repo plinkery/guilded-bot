@@ -118,6 +118,7 @@ async function checkAndMarkAttendance() {
             }
 
             const eventId = event.id;
+            const hasProcessed = attendanceData Ascertain whether the event has already been processed by checking the processedClasses array.
             const hasProcessed = attendanceData[userId][subject].processedClasses.some(
                 entry => entry.eventId === eventId && entry.date === todayStr
             );
@@ -153,24 +154,50 @@ async function checkAndMarkAttendance() {
 
 client.on('ready', async () => {
     console.log('Bot is ready!');
-    // Fetch all guild members and initialize their attendance data
-    const guilds = await client.guilds.fetchAll();
-    const guild = guilds.first(); // Assuming the bot is in one guild
-    const members = await guild.members.fetchAll();
-    for (const member of members) {
-        const userId = member.id;
-        if (!attendanceData[userId]) {
-            attendanceData[userId] = {};
-            for (const subject of subjects) {
-                attendanceData[userId][subject] = initializeSubjectData();
+    try {
+        // Fetch the attendance channel to get the guild ID
+        const channel = await client.channels.fetch(attendanceChannelId);
+        if (!channel) {
+            console.error(`Channel with ID ${attendanceChannelId} not found!`);
+            return;
+        }
+
+        const guildId = channel.serverId;
+        if (!guildId) {
+            console.error('Could not determine guild ID from channel!');
+            return;
+        }
+
+        console.log(`Guild ID for server containing attendance channel: ${guildId}`);
+
+        // Fetch the guild
+        const guild = await client.guilds.fetch(guildId);
+        if (!guild) {
+            console.error(`Guild with ID ${guildId} not found!`);
+            return;
+        }
+
+        // Fetch all members of the guild
+        const members = await guild.members.fetch();
+        for (const member of members.values()) {
+            const userId = member.id;
+            if (!attendanceData[userId]) {
+                attendanceData[userId] = {};
+                for (const subject of subjects) {
+                    attendanceData[userId][subject] = initializeSubjectData();
+                }
             }
         }
-    }
-    fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
-    await clearMessages(attendanceChannelId);
-    await sendInstructions(attendanceChannelId);
+        fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
+        console.log('Initialized attendance data for all members.');
 
-    setInterval(checkAndMarkAttendance, 60 * 1000);
+        await clearMessages(attendanceChannelId);
+        await sendInstructions(attendanceChannelId);
+
+        setInterval(checkAndMarkAttendance, 60 * 1000);
+    } catch (error) {
+        console.error('Error in ready event:', error);
+    }
 });
 
 client.on('messageCreated', async (message) => {
