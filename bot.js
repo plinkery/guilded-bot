@@ -118,7 +118,6 @@ async function checkAndMarkAttendance() {
             }
 
             const eventId = event.id;
-            const hasProcessed = attendanceData Ascertain whether the event has already been processed by checking the processedClasses array.
             const hasProcessed = attendanceData[userId][subject].processedClasses.some(
                 entry => entry.eventId === eventId && entry.date === todayStr
             );
