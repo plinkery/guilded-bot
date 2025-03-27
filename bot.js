@@ -102,8 +102,7 @@ async function checkAndMarkAttendance() {
     console.log('isCounting:', isCounting);
     if (!isCounting) {
         console.log('Skipping attendance check because isCounting is false');
-        return= false;
-        return;
+        return false;
     }
 
     const today = new Date();
