@@ -5,6 +5,9 @@ const client = new Client({ token: 'gapi_p250JWJU+F/HVxIeYU6y50vi42LdreYxMf3e6wr
 const attendanceChannelId = '2a41589e-d9a7-4c51-9ddb-a2351a2fbe7e';
 const calendarChannelId = '98fb5e68-bebd-44ad-8c65-ade71f56df14';
 
+// Assuming you're in IST (UTC+5:30)
+const TIME_ZONE_OFFSET = 5.5 * 60 * 60 * 1000; // IST offset in milliseconds
+
 let isCounting = false;
 let lastCommand = null;
 let lastProcessedDate = null;
@@ -95,15 +98,31 @@ async function sendInstructions(channelId) {
 }
 
 async function checkAndMarkAttendance() {
-    if (!isCounting) return;
+    console.log('checkAndMarkAttendance called at', new Date().toISOString());
+    console.log('isCounting:', isCounting);
+    if (!isCounting) {
+        console.log('Skipping attendance check because isCounting is false');
+        return= false;
+        return;
+    }
 
     const today = new Date();
-    const todayStr = today.toLocaleDateString('en-GB');
-    const now = today.getTime();
+    const todayInIST = new Date(today.getTime() + TIME_ZONE_OFFSET);
+    const todayStr = todayInIST.toLocaleDateString('en-GB');
+    const now = todayInIST.getTime();
+
+    console.log('Today in IST:', todayInIST.toISOString());
+    console.log('Today string:', todayStr);
+    console.log('Current time in IST (ms):', now);
 
     const events = await getCalendarEvents(today);
+    console.log('Calendar events for today:', events);
+
     const isHoliday = events.calendarEvents.some(e => e.name.toLowerCase().includes('holiday') || e.name.toLowerCase().includes('festival'));
-    if (isHoliday) return;
+    if (isHoliday) {
+        console.log('Today is a holiday, skipping attendance marking');
+        return;
+    }
 
     for (const userId in attendanceData) {
         if (!attendanceData[userId]) continue;
@@ -111,7 +130,12 @@ async function checkAndMarkAttendance() {
         for (const event of events.calendarEvents) {
             const startTime = new Date(event.startsAt).getTime();
             const subject = event.name.toLowerCase().replace(' class', '').trim();
-            if (!subjects.includes(subject)) continue;
+            console.log(`Processing event: ${event.name}, Start Time: ${new Date(startTime).toISOString()}, Subject: ${subject}`);
+
+            if (!subjects.includes(subject)) {
+                console.log(`Subject ${subject} not in subjects list, skipping`);
+                continue;
+            }
 
             if (!attendanceData[userId][subject]) {
                 attendanceData[userId][subject] = initializeSubjectData();
@@ -121,8 +145,17 @@ async function checkAndMarkAttendance() {
             const hasProcessed = attendanceData[userId][subject].processedClasses.some(
                 entry => entry.eventId === eventId && entry.date === todayStr
             );
+            console.log(`Event ID: ${eventId}, Has Processed: ${hasProcessed}, Start Time (ms): ${startTime}, Now (ms): ${now}`);
 
-            if (hasProcessed || startTime > now) continue;
+            if (hasProcessed) {
+                console.log(`Event ${eventId} on ${todayStr} already processed for user ${userId}, skipping`);
+                continue;
+            }
+
+            if (startTime > now) {
+                console.log(`Event ${eventId} starts in the future (${new Date(startTime).toISOString()}), skipping`);
+                continue;
+            }
 
             const isAbsentToday = attendanceData[userId][subject].absentToday;
             const hasFullAbsence = attendanceData[userId][subject].absentDates.some(
@@ -131,6 +164,7 @@ async function checkAndMarkAttendance() {
             const hasSubjectAbsence = attendanceData[userId][subject].absentDates.some(
                 entry => entry.date === todayStr && !entry.fullAbsence
             );
+            console.log(`User ${userId}, Subject ${subject}: isAbsentToday: ${isAbsentToday}, hasFullAbsence: ${hasFullAbsence}, hasSubjectAbsence: ${hasSubjectAbsence}`);
 
             if (!isAbsentToday && !hasFullAbsence && !hasSubjectAbsence) {
                 attendanceData[userId][subject].attended += 1;
@@ -149,12 +183,12 @@ async function checkAndMarkAttendance() {
     }
 
     fs.writeFileSync('attendance.json', JSON.stringify(attendanceData));
+    console.log('Attendance data updated');
 }
 
 client.on('ready', async () => {
     console.log('Bot is ready!');
     try {
-        // Fetch the attendance channel to get the guild ID
         const channel = await client.channels.fetch(attendanceChannelId);
         if (!channel) {
             console.error(`Channel with ID ${attendanceChannelId} not found!`);
@@ -169,14 +203,12 @@ client.on('ready', async () => {
 
         console.log(`Guild ID for server containing attendance channel: ${guildId}`);
 
-        // Fetch the guild
         const guild = await client.guilds.fetch(guildId);
         if (!guild) {
             console.error(`Guild with ID ${guildId} not found!`);
             return;
         }
 
-        // Fetch all members of the guild
         const members = await guild.members.fetch();
         for (const member of members.values()) {
             const userId = member.id;
@@ -194,6 +226,7 @@ client.on('ready', async () => {
         await sendInstructions(attendanceChannelId);
 
         setInterval(checkAndMarkAttendance, 60 * 1000);
+        console.log('Started attendance check interval');
     } catch (error) {
         console.error('Error in ready event:', error);
     }
@@ -212,7 +245,8 @@ client.on('messageCreated', async (message) => {
     console.log('Mention:', mention);
     const targetId = mention || senderId;
     const today = new Date();
-    const todayStr = today.toLocaleDateString('en-GB');
+    const todayInIST = new Date(today.getTime() + TIME_ZONE_OFFSET);
+    const todayStr = todayInIST.toLocaleDateString('en-GB');
 
     if (lastProcessedDate !== todayStr) {
         for (const userId in attendanceData) {
@@ -233,7 +267,7 @@ client.on('messageCreated', async (message) => {
 
     const retroactiveAbsenceMatch = command.match(/^!abb(\d{8})$/);
     let events;
-    let targetDate = today;
+    let targetDate = todayInIST;
     let targetDateStr = todayStr;
 
     if (retroactiveAbsenceMatch) {
@@ -390,16 +424,15 @@ client.on('messageCreated', async (message) => {
         lastCommand = { type: 'abbSubject', targetId, subject, events };
         await client.rest.post(`/channels/${channelId}/messages`, { content: `Noted! ${targetId === senderId ? 'Your' : `<@${targetId}>’s`} status:\n${getStatus(targetId)}` });
     } else if (command === '!abbrest') {
-        const now = today.getTime();
-        const todayStr = today.toLocaleDateString('en-GB');
+        const now = todayInIST.getTime();
+        const todayStr = todayInIST.toLocaleDateString('en-GB');
         const subjectCounts = {};
         const pastSubjectCounts = {};
         const futureSubjectCounts = {};
 
-        // Count all classes, past classes, and future classes for today
         for (const event of events.calendarEvents) {
             const eventDateStr = new Date(event.startsAt).toLocaleDateString('en-GB');
-            if (eventDateStr !== todayStr) continue; // Skip events not on today
+            if (eventDateStr !== todayStr) continue;
 
             const subject = event.name.toLowerCase().replace(' class', '').trim();
             if (!subjects.includes(subject)) continue;
@@ -424,7 +457,6 @@ client.on('messageCreated', async (message) => {
                 attendanceData[targetId][subject] = initializeSubjectData();
             }
 
-            // Clear today's processed classes and absences
             attendanceData[targetId][subject].absentDates = attendanceData[targetId][subject].absentDates.filter(
                 entry => entry.date !== todayStr
             );
@@ -436,7 +468,6 @@ client.on('messageCreated', async (message) => {
             const futureClasses = futureSubjectCounts[subject] || 0;
             const totalClasses = subjectCounts[subject];
 
-            // Reset total and attended for today
             const wasPreviouslyCounted = attendanceData[targetId][subject].processedClasses.some(
                 entry => entry.date === todayStr
             );
@@ -445,7 +476,6 @@ client.on('messageCreated', async (message) => {
                 attendanceData[targetId][subject].attended = 0;
             }
 
-            // Mark past classes as attended, future classes as absent
             attendanceData[targetId][subject].total += totalClasses;
             attendanceData[targetId][subject].attended += pastClasses;
             if (futureClasses > 0) {
@@ -539,7 +569,7 @@ client.on('messageCreated', async (message) => {
         } else if (lastCommand.type === 'abbrest') {
             const subjectCounts = {};
             const futureSubjectCounts = {};
-            const now = today.getTime();
+            const now = todayInIST.getTime();
             for (const event of lastCommand.events.calendarEvents) {
                 const eventDateStr = new Date(event.startsAt).toLocaleDateString('en-GB');
                 if (eventDateStr !== todayStr) continue;
